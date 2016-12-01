@@ -35,6 +35,7 @@ from datetime import datetime
 import shutil
 import struct
 import logging
+import pickle
 
 from logging_conf import logger_factory
 
@@ -73,45 +74,112 @@ class ImporterException(Exception):
     pass
 
 
-class RepositoryManager(object):
-    """Manages the Repository and its operations
+class ImporterFileExistException(ImporterException):
+    pass
 
-    Given a Repository, a SourceFilesManager, and an optional DataBase,
-    coordinates all interactions between these entities.
+
+class ImporterDuplicateContentException(ImporterException):
+    pass
+
+
+class RepositoryManager(object):
+    """Main class to insert photos in the repository.
+
+    Given a Repository object and a SourceFilesManager object this class manges
+    the insert operations into the repository.
+
+    :param repository: Repository
+    :param source_fm: SourceFilesManager
     """
     def __init__(self, repository, source_fm):
         self.__repo = repository
+        self.repo = repository
         self.__source_fm = source_fm
 
-        # SourceFiles with import error.
-        self.__sf_with_import_error = []
+        # Insert results list
+        self.__insert_res = None
 
     def __insert(self, overwrite=False, alternate_names=False, dry_run=False):
 
+        self.__insert_res = []
+
         for source_file in self.__source_fm.files:
-            # TODO. Que passa si hi ha un error al insert, per mès que previament
-            # haguem fet un sfm.check??
             try:
                 # import pdb; pdb.set_trace()
                 self.__repo.insert(
                     source_file, dest_path=None, overwrite=overwrite,
                     alternate_names=alternate_names, dry_run=dry_run)
                 logger_trans.info('Insert OK {}'.format(source_file))
+                self.__insert_res.append(InsertResult(source_file))
             except Exception, ex:
                 logger_trans.error('Insert ERROR {}'.format(source_file))
                 logger_err.exception('Insert exception')
-                self.__sf_with_import_error.append(source_file)
+                self.__insert_res.append(InsertResult(source_file, exception=ex))
+        self.report()
 
     def insert_strict(self, dry_run=False):
-        """Raise error if file exist in the destination path.
+        """Insert files. Raise error if a file with same name exits.
 
-        If there exist a file with the same name as the source file being
-        imported, raise error.
+        Insert all files in SourceFilesManager into the repository. Strict insert
+        means that if in the repository there exist a file with the same name as
+        the source file being imported, raise error.
 
-        :param dry_run: bool
-        :return:
+        Files names are compared taking into account all file path plus file
+        name.
+
+        File names comparison it is not case sensitive:
+            'img_0001.jpg' is the same as 'IMG_0001.JPG'
+
+        :param dry_run: bool. Optional. Default to False.
+            If it is True, simulates an insert without inserting the files.
+        :return: void
         """
+        # Parameters in the insert method determine the kind of insert done.
+        # To do a strict insert it is required to set:
+        #   - overwrite=False. It is not allowed to overwrite files.
+        #   - alternate_names=False. It is not allowed to change the file name.
         self.__insert(overwrite=False, alternate_names=False, dry_run=dry_run)
+
+    def report(self):
+        print 'Files to be inserted: {}'.format(len(self.__source_fm.files))
+        print 'Files inserted OK: {}'.format(len(self.files_insert_ok()))
+        print 'Files with insert ERR : {}'.format(len(self.files_insert_error()))
+
+    def results(self):
+        return self.__insert_res
+
+    def files_insert_ok(self):
+        return [ir.source_file for ir in self.__insert_res if not ir.has_error]
+
+    def files_insert_error(self):
+        return [ir.source_file for ir in self.__insert_res if ir.has_error]
+
+    def errors(self):
+        return [(ir.source_file.fpath, ir.exception)
+                for ir in self.__insert_res
+                if ir.has_error]
+
+    def errors_by_type(self):
+        errs = [type(ir.exception) for ir in self.__insert_res if ir.has_error]
+        return collections.Counter(errs)
+
+
+class InsertResult(object):
+    def __init__(self, source_file, exception=None):
+        self.__sf = source_file
+        self.__exception = exception
+
+    @property
+    def source_file(self):
+        return self.__sf
+
+    @property
+    def exception(self):
+        return self.__exception
+
+    @property
+    def has_error(self):
+        return self.__exception is not None
 
 
 class Repository(object):
@@ -125,6 +193,7 @@ class Repository(object):
         # It can be None in case of new repository.
         self.__path = path
         self.__sfm = SourceFilesManger(path)
+        self.__hash_db = None
 
         if self.__path is not None:
             try:
@@ -135,6 +204,12 @@ class Repository(object):
     @property
     def path(self):
         return self.__path
+
+    @property
+    def db(self):
+        if self.__hash_db is None:
+            raise ValueError('DB not initialized.')
+        return self.__hash_db
 
     def create(self, path):
         """Create a new repository.
@@ -196,6 +271,9 @@ class Repository(object):
         #     #traceback.print_exc(file=sys.stdout)
         #     raise ex
 
+        if self.__hash_db is not None:
+            self.content_exist(source_file)
+
         repo_importer = importer_class(
             source_file, dest_path_callback, dry_run)
         repo_importer.insert()
@@ -215,9 +293,61 @@ class Repository(object):
     def describe_paths(self):
         return self.__sfm.describe_paths()
 
-    def scan(self, db):
-        """Scan through all directories in the repo to build the database."""
-        raise NotImplementedError()
+    @property
+    def files(self):
+        return self.__sfm.files
+
+    def db_scan(self):
+        """Scan through all directories in the repo to build the database.
+
+        Raise ValueError if it finds duplicate content.
+        """
+        self.__hash_db = {}
+        for sf in self.__sfm.files:
+            sf_hash = sf.hash()
+            if sf_hash in self.__hash_db:
+                f1 = sf.fpath
+                f2 = self.__hash_db[sf_hash]
+                raise ValueError('Duplicate file {} - {}'.format(f1, f2))
+            self.__hash_db[sf.hash()] = sf.fpath
+
+    def db_save(self, path='./db/', fname='repo.pkl'):
+        """Save DB to file."""
+        if self.__hash_db is None:
+            raise ValueError('DB not initialized. Nothing to be saved.')
+        fpath = os.path.join(path, fname)
+        if os.path.exists(path) is False:
+            raise ValueError('Path does not exists.')
+        with open(fpath, 'wb') as f:
+            try:
+                pickle.dump(self.__hash_db, f)
+            except Exception:
+                print 'Error serializing DB.'
+
+    def db_load(self,  path='./db/', fname='repo.pkl'):
+        """Load DB from file."""
+        fpath = os.path.join(path, fname)
+        with open(fpath, 'rb') as f:
+            try:
+                self.__hash_db = pickle.load(f)
+            except EOFError:
+                # EOFError has not associated message. When we print the message,
+                # nothing is printed. That's why we catch this concrete error, to
+                # print a personalized message.
+                print 'Error loading DB.'
+
+    def content_exist(self, sf):
+        """Given a SourceFile check if exists in DB."""
+        sf_hash = sf.hash()
+        try:
+            existing_fpath = self.__hash_db[sf_hash]
+
+            # No KeyError exception: hash exists.
+            raise ImporterDuplicateContentException(existing_fpath)
+
+        except KeyError:
+            # Hash doesn't exist, so content doesn't exist in DB.
+            return False
 
     def __repr__(self):
         if self.__path is not None:
@@ -281,7 +411,7 @@ class SourceFilesManger(object):
             # TODO implementar generador
             # http://stackoverflow.com/questions/19151/build-a-basic-python-iterator
             self.__sfiles = [self.__factory_method(SourceFile(sp))
-                             for sp in self.source_paths]
+                             for sp in self.source_paths()]
 
     def __read_source_paths(self):
         """Read and return the path for all files in the SourceFileManager path."""
@@ -290,7 +420,6 @@ class SourceFilesManger(object):
             regexp=self.__regexp, exclude_ext=self.__exclude_ext)
         return self.__spaths
 
-    @property
     def source_paths(self):
         """Return the path for all files in the SourceFileManager path."""
         if self.__spaths is None:
@@ -306,7 +435,8 @@ class SourceFilesManger(object):
         return list(counter.iteritems())
 
     def describe_paths(self):
-        return list(collections.Counter([sf.path for sf in self.files]).iteritems())
+        return sorted(list(collections.Counter(
+            [sf.path for sf in self.files]).iteritems()))
 
     def check(self):
         total_proc= 0
@@ -456,7 +586,8 @@ class SourceFileEXIF(SourceFile):
         self.__load()
         exif_data = self.__exif_data()
         try:
-            create = exif_data[EXIF_DATE_ORIGINAL_CODE][0]
+            # create = exif_data[EXIF_DATE_ORIGINAL_CODE][0]
+            create = exif_data[EXIF_DATE_ORIGINAL_CODE]
         except KeyError:
             raise PhotoException('{} SourceFileEXIF EXIF data does not have '
                            'creation date.'.format(self._fpath))
@@ -465,7 +596,6 @@ class SourceFileEXIF(SourceFile):
         except ValueError, ex:
             raise PhotoException('{} SourceFileEXIF invalid EXIF '
                                  'data: {}.'.format(self._fpath, ex.message))
-
 
     @property
     def exif_data(self, tags=True):
@@ -720,7 +850,7 @@ class RepositoryImporterStrict(AbstractRepositoryImporter):
         # Check if file exists.
         for fpath in [fpath_lower, fpath_upper]:
             if os.path.isfile(fpath):
-                raise ImporterException('{}. File exsit: {}'.format(
+                raise ImporterFileExistException('{}. File exsit: {}'.format(
                     self.__class__.__name__, fpath))
 
         self._copy(self._source_file.basename)
@@ -803,7 +933,7 @@ def files_in_folder(path, recursive=True, to_lower=False, regexp=None,
     """
     to_lower is applied only to file names, not to path string.
 
-    to_lower is applied before than regexp does, so regexp has to take in to 
+    to_lower is applied before than regexp does, so regexp has to take in to
     account that it must be prepared for text which has been transformed to lower.
     """
     files = []
@@ -881,4 +1011,9 @@ def check_input(path):
     return sfm
 
 if __name__ == '__main__':
-    equal()
+    sfm = SourceFilesManger('/home/sergi/Pictures/2010')
+    repo = Repository('/home/sergi/Dropbox/Fotos')
+    # sfm = SourceFilesManger('/home/sergi/Desktop/Photos_1')
+    # repo = Repository('/home/sergi/Desktop/Photos_2')
+    mng = RepositoryManager(repo, sfm)
+
